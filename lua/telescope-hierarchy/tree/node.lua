@@ -310,6 +310,31 @@ function Node:sort_children()
 end
 
 ---@param uri string
+---@param method table
+---@return Node
+local function build_method_node(uri, method)
+    local stub_cache = {
+        location = {
+            textDocument = { uri = uri },
+            position = {
+                line = method.selectionRange.start.line,
+                character = method.selectionRange.start.character,
+            },
+        },
+        name = method.name,
+        searched = "Yes",
+        searched_node = { children = {} },
+        children = {},
+        callbacks = {},
+    }
+    local child =
+        Node.new(uri, method.name, method.selectionRange.start.line + 1, method.selectionRange.start.character + 1, stub_cache)
+    child.node_kind = "method"
+    child.expanded = true
+    return child
+end
+
+---@param uri string
 ---@param field table
 ---@param is_overridden boolean
 ---@return Node
@@ -373,11 +398,13 @@ local function pre_resolve_field_objects(nodes, callback)
             done()
         else
             local child_uri = vim.uri_from_fname(child.filename)
-            parser.resolve_class_fields(
+            parser.resolve_class_members(
                 child_uri,
                 child.field_type_ref or child.field_type_name,
-                function(resolved_fields, _, _, err)
-                    if err ~= nil or #resolved_fields == 0 then
+                function(resolved_methods, resolved_fields, _, _, err)
+                    local method_count = resolved_methods and #resolved_methods or 0
+                    local field_count = resolved_fields and #resolved_fields or 0
+                    if err ~= nil or (method_count == 0 and field_count == 0) then
                         child.node_kind = "field"
                     end
                     done()
@@ -500,23 +527,7 @@ function Node:load_members(callback)
         local parent_class = find_parent_class_node(self)
         local method_nodes = {}
         for _, m in ipairs(methods) do
-            local stub_cache = {
-                location = {
-                    textDocument = { uri = uri },
-                    position = {
-                        line = m.selectionRange.start.line,
-                        character = m.selectionRange.start.character,
-                    },
-                },
-                name = m.name,
-                searched = "Yes",
-                searched_node = { children = {} },
-                children = {},
-                callbacks = {},
-            }
-            local child =
-                Node.new(uri, m.name, m.selectionRange.start.line + 1, m.selectionRange.start.character + 1, stub_cache)
-            child.node_kind = "method"
+            local child = build_method_node(uri, m)
             if
                 parent_class ~= nil
                 and parent_class.method_names ~= nil
@@ -568,30 +579,56 @@ function Node:load_members(callback)
     end)
 end
 
----Expand a field_object node by resolving its class type and fetching its fields.
+---Expand a field_object node by resolving its class type and fetching its fields and methods.
 ---@async
 ---@param callback fun(node: Node)
 function Node:_load_object_fields(callback)
     self.children = {} -- clear on re-expand
     local parser = require("telescope-hierarchy.parser")
     local source_uri = vim.uri_from_fname(self.filename)
-    parser.resolve_class_fields(source_uri, self.field_type_ref or self.field_type_name, function(fields, uri, _, err)
-        if err ~= nil or not uri or #fields == 0 then
-            self.node_kind = "field"
-            callback(self)
-            return
+    parser.resolve_class_members(
+        source_uri,
+        self.field_type_ref or self.field_type_name,
+        function(methods, fields, uri, _, err)
+            methods = methods or {}
+            fields = fields or {}
+            if err ~= nil or not uri or (#methods == 0 and #fields == 0) then
+                self.node_kind = "field"
+                callback(self)
+                return
+            end
+
+            for _, f in ipairs(fields) do
+                local child = build_field_node(uri, f, false)
+                child.parent = self
+                child.root = self.root
+                table.insert(self.children, child)
+            end
+
+            local method_nodes = {}
+            for _, m in ipairs(methods) do
+                local child = build_method_node(uri, m)
+                child.parent = self
+                child.root = self.root
+                table.insert(method_nodes, child)
+            end
+
+            table.sort(method_nodes, function(a, b)
+                if a.lnum == b.lnum then
+                    return a.col < b.col
+                end
+                return a.lnum < b.lnum
+            end)
+            for _, child in ipairs(method_nodes) do
+                table.insert(self.children, child)
+            end
+
+            self.expanded = true
+            pre_resolve_field_objects(self.children, function()
+                callback(self)
+            end)
         end
-        for _, f in ipairs(fields) do
-            local child = build_field_node(uri, f, false)
-            child.parent = self
-            child.root = self.root
-            table.insert(self.children, child)
-        end
-        self.expanded = true
-        pre_resolve_field_objects(self.children, function()
-            callback(self)
-        end)
-    end)
+    )
 end
 
 ---Ensure the current class node has had its hierarchy children resolved without

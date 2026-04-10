@@ -27,6 +27,151 @@ local function force_selection(picker, row)
     picker:set_selection(row)
 end
 
+---@param picker Picker
+local function center_results_view(picker)
+    if picker == nil or picker.results_win == nil or not vim.api.nvim_win_is_valid(picker.results_win) then
+        return
+    end
+
+    local wininfo = vim.fn.getwininfo(picker.results_win)[1]
+    if wininfo == nil then
+        return
+    end
+
+    local cursor_line = (vim.api.nvim_win_get_cursor(picker.results_win)[1] or 1)
+    local height = vim.api.nvim_win_get_height(picker.results_win)
+    if height <= 0 then
+        return
+    end
+
+    local total_lines = picker.manager and picker.manager:num_results() or 0
+    if total_lines <= 0 then
+        return
+    end
+
+    local anchor = math.max(1, math.floor((height + 1) / 2))
+    local max_topline = math.max(1, total_lines - height + 1)
+    local desired_topline = math.max(1, math.min(cursor_line - anchor + 1, max_topline))
+    if wininfo.topline == desired_topline then
+        return
+    end
+
+    vim.api.nvim_win_call(picker.results_win, function()
+        vim.fn.winrestview({ topline = desired_topline })
+    end)
+end
+
+---@param picker Picker
+local function request_center_results_view(picker)
+    if picker == nil or picker._hierarchy_center_results_pending == true then
+        return
+    end
+
+    picker._hierarchy_center_results_pending = true
+    vim.schedule(function()
+        if picker == nil then
+            return
+        end
+        picker._hierarchy_center_results_pending = false
+        center_results_view(picker)
+    end)
+end
+
+---@param picker Picker
+local function ensure_centered_selection_behavior(picker)
+    if picker == nil or picker._hierarchy_center_selection_wrapped == true then
+        return
+    end
+
+    local original_set_selection = picker.set_selection
+    picker.set_selection = function(self, row)
+        original_set_selection(self, row)
+        request_center_results_view(self)
+    end
+    picker._hierarchy_center_selection_wrapped = true
+end
+
+---@param node Node | nil
+---@return string | nil
+local function node_selection_key(node)
+    if node == nil then
+        return nil
+    end
+
+    local location = node.cache and node.cache.location or nil
+    local uri = location and location.textDocument and location.textDocument.uri or ""
+    local line = location and location.position and location.position.line or -1
+    local col = location and location.position and location.position.character or -1
+
+    return table.concat({
+        node.node_kind or "",
+        node.text or "",
+        node.filename or "",
+        tostring(node.lnum or -1),
+        tostring(node.col or -1),
+        uri,
+        tostring(line),
+        tostring(col),
+    }, "|")
+end
+
+---@param picker Picker
+---@return string
+local function picker_prompt(picker)
+    local ok, prompt = pcall(function()
+        return picker:_get_prompt()
+    end)
+    if ok and type(prompt) == "string" then
+        return prompt
+    end
+
+    local prompt_bufnr = picker.prompt_bufnr
+    if prompt_bufnr ~= nil and vim.api.nvim_buf_is_valid(prompt_bufnr) then
+        local lines = vim.api.nvim_buf_get_lines(prompt_bufnr, 0, 1, false)
+        return lines[1] or ""
+    end
+
+    return ""
+end
+
+---@param root Node
+---@param prompt string
+---@param selected_node Node | nil
+---@return integer | nil
+local function preferred_selection_index(root, prompt, selected_node)
+    local visible = root:to_list(false, prompt)
+    if #visible == 0 then
+        return nil
+    end
+
+    if selected_node == nil then
+        return 1
+    end
+
+    local visible_by_key = {}
+    for index, entry in ipairs(visible) do
+        if entry.node == selected_node then
+            return index
+        end
+
+        local key = node_selection_key(entry.node)
+        if key ~= nil and visible_by_key[key] == nil then
+            visible_by_key[key] = index
+        end
+    end
+
+    local candidate = selected_node
+    while candidate ~= nil do
+        local key = node_selection_key(candidate)
+        if key ~= nil and visible_by_key[key] ~= nil then
+            return visible_by_key[key]
+        end
+        candidate = candidate.parent
+    end
+
+    return 1
+end
+
 ---A higher-ordered function, a function that returns a function
 ---This follows the pattern set out in "Telescope.make_entry" in that we contain all the
 ---logic for rendering a single row into a function.
@@ -354,6 +499,10 @@ M.show = function(root, opts)
 
     picker._hierarchy_opts = vim.deepcopy(opts)
     picker.layout_strategy = layout_strategy or picker.layout_strategy
+    ensure_centered_selection_behavior(picker)
+    picker:register_completion_callback(function(self)
+        request_center_results_view(self)
+    end)
     local callbacks = { unpack(picker._completion_callbacks or {}) }
     picker:register_completion_callback(function(self)
         if self.manager and self.manager:num_results() > 0 then
@@ -370,18 +519,18 @@ end
 ---@param picker Picker
 ---@param keep_selection? boolean Retain the current selection after refresh. If ommitted will assume true
 M.refresh = function(node, picker, keep_selection)
+    local root = node.root
     local new_finder = make_finder(node.root, picker._hierarchy_opts or {})
 
     if keep_selection or keep_selection == nil then
-        local selection = picker._selection_row
-        if selection == nil then
-            selection = 0
-        end
+        local selection_node = picker._selection_entry and picker._selection_entry.value or nil
         local callbacks = { unpack(picker._completion_callbacks or {}) } -- shallow copy
         picker:register_completion_callback(function(self)
             local results_count = self.manager and self.manager:num_results() or 0
             if results_count > 0 then
-                force_selection(self, math.min(selection, math.max(0, results_count - 1)))
+                local prompt = picker_prompt(self)
+                local index = preferred_selection_index(root, prompt, selection_node) or 1
+                force_selection(self, self:get_row(math.min(index, results_count)))
             end
             self._completion_callbacks = callbacks
         end)
