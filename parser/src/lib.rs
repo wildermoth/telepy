@@ -1515,7 +1515,7 @@ fn render_field_node(index: &WorkspaceIndex, module: &ModuleInfo, field: &FieldI
         if let Some((target_module, _target_external)) = get_module(index, &resolved_module) {
             if let Some(class_index) = target_module.class_index.get(&resolved_class) {
                 if let Some(target_class) = target_module.classes.get(*class_index) {
-                    if !target_class.fields.is_empty() {
+                    if !target_class.fields.is_empty() || !target_class.methods.is_empty() {
                         node.kind = "field_object".to_string();
                     }
                 }
@@ -3322,6 +3322,9 @@ fn resolve_base(index: &WorkspaceIndex, module: &ModuleInfo, raw_base: &str) -> 
         if let Some(resolved) = resolve_named_symbol(index, &module.module_name, name, &display) {
             return resolved;
         }
+        if let Some(resolved) = resolve_named_symbol(index, "builtins", name, &display) {
+            return resolved;
+        }
         if name == "object" {
             return ResolvedBase::External {
                 module: "builtins".to_string(),
@@ -3832,6 +3835,36 @@ mod tests {
     }
 
     #[test]
+    fn resolves_bare_builtin_bases_in_external_modules() {
+        let root = unique_temp_root();
+        write_file(
+            &root.join(".venv/lib/python3.14/site-packages/builtins.pyi"),
+            "class object:\n    pass\n\nclass str(object):\n    pass\n",
+        );
+        write_file(
+            &root.join(".venv/lib/python3.14/site-packages/enum.pyi"),
+            "class ReprEnum:\n    pass\n\nclass StrEnum(str, ReprEnum):\n    pass\n",
+        );
+
+        let build = build_workspace_index(&root).expect("build workspace index");
+        let result = query_type_hierarchy(
+            &build.index,
+            &root.join(".venv/lib/python3.14/site-packages/enum.pyi"),
+            "StrEnum",
+        )
+        .expect("query external module");
+
+        assert_eq!(result.hierarchy.module, "enum");
+        assert_eq!(result.hierarchy.ancestors.len(), 2);
+        assert_eq!(result.hierarchy.ancestors[0].name, "str");
+        assert_eq!(result.hierarchy.ancestors[0].module, "builtins");
+        assert_eq!(result.hierarchy.ancestors[1].name, "ReprEnum");
+        assert_eq!(result.hierarchy.ancestors[1].module, "enum");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn resolves_workspace_subtypes() {
         let index = build_test_index(&[
             ("src/pkg/common.py", "class BaseModel:\n    pass\n"),
@@ -3860,7 +3893,7 @@ mod tests {
         let index = build_test_index(&[
             (
                 "src/pkg/common.py",
-                "class Collection:\n    title: str\n    slug: str | None\n",
+                "class Collection:\n    title: str\n    slug: str | None\n\n    def normalize(self) -> str:\n        return self.title\n",
             ),
             (
                 "src/pkg/model.py",
@@ -3886,9 +3919,37 @@ mod tests {
         )
         .expect("resolved field members");
         assert_eq!(resolved.class_name, "Collection");
+        assert_eq!(resolved.methods.len(), 1);
+        assert_eq!(resolved.methods[0].name, "normalize");
         assert_eq!(resolved.fields.len(), 2);
         assert_eq!(resolved.fields[0].name, "title");
         assert_eq!(resolved.fields[1].name, "slug");
+    }
+
+    #[test]
+    fn marks_method_only_field_targets_as_field_objects() {
+        let index = build_test_index(&[
+            (
+                "src/pkg/common.py",
+                "class Collection:\n    def normalize(self) -> str:\n        return \"\"\n",
+            ),
+            (
+                "src/pkg/model.py",
+                "from .common import Collection\n\nclass Prize:\n    collection: Collection\n",
+            ),
+        ]);
+
+        let tree = query_subtypes_tree_limited(
+            &index,
+            &PathBuf::from("/tmp/project/src/pkg/model.py"),
+            "Prize",
+            Some(1),
+            Some(1),
+        )
+        .expect("subtype tree");
+        assert_eq!(tree.tree.children.len(), 1);
+        assert_eq!(tree.tree.children[0].name, "collection");
+        assert_eq!(tree.tree.children[0].kind, "field_object");
     }
 
     #[test]

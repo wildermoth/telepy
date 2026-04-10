@@ -483,6 +483,25 @@ local function to_field_symbol(field)
     }
 end
 
+local function decode_class_member_response(response)
+    local methods = {}
+    for _, method in ipairs((response and response.methods) or {}) do
+        table.insert(methods, to_method_symbol(method))
+    end
+
+    local fields = {}
+    for _, field in ipairs((response and response.fields) or {}) do
+        table.insert(fields, to_field_symbol(field))
+    end
+
+    local resolved_uri = nil
+    if response and response.file and response.file ~= vim.NIL then
+        resolved_uri = vim.uri_from_fname(response.file)
+    end
+
+    return methods, fields, resolved_uri, response and response.class_name or nil
+end
+
 local function to_lsp_range(range)
     return {
         start = {
@@ -661,17 +680,26 @@ function M.get_class_members(uri, class_name, callback)
             return
         end
 
-        local methods = {}
-        for _, method in ipairs((response and response.methods) or {}) do
-            table.insert(methods, to_method_symbol(method))
-        end
-
-        local fields = {}
-        for _, field in ipairs((response and response.fields) or {}) do
-            table.insert(fields, to_field_symbol(field))
-        end
-
+        local methods, fields = decode_class_member_response(response)
         callback(methods, fields, nil)
+    end)
+end
+
+---@param uri string
+---@param type_ref string
+---@param callback fun(methods: lsp.DocumentSymbol[] | nil, fields: lsp.DocumentSymbol[] | nil, resolved_uri: string | nil, resolved_name: string | nil, err: string | nil)
+function M.resolve_class_members(uri, type_ref, callback)
+    request(uri, {
+        action = "resolve_class_fields",
+        class = type_ref,
+    }, function(response, err)
+        if err then
+            callback(nil, nil, nil, nil, err)
+            return
+        end
+
+        local methods, fields, resolved_uri, resolved_name = decode_class_member_response(response)
+        callback(methods, fields, resolved_uri, resolved_name, nil)
     end)
 end
 
@@ -679,26 +707,8 @@ end
 ---@param type_ref string
 ---@param callback fun(fields: lsp.DocumentSymbol[] | nil, resolved_uri: string | nil, resolved_name: string | nil, err: string | nil)
 function M.resolve_class_fields(uri, type_ref, callback)
-    request(uri, {
-        action = "resolve_class_fields",
-        class = type_ref,
-    }, function(response, err)
-        if err then
-            callback(nil, nil, nil, err)
-            return
-        end
-
-        local fields = {}
-        for _, field in ipairs((response and response.fields) or {}) do
-            table.insert(fields, to_field_symbol(field))
-        end
-
-        local resolved_uri = nil
-        if response and response.file and response.file ~= vim.NIL then
-            resolved_uri = vim.uri_from_fname(response.file)
-        end
-
-        callback(fields, resolved_uri, response and response.class_name or nil, nil)
+    M.resolve_class_members(uri, type_ref, function(_, fields, resolved_uri, resolved_name, err)
+        callback(fields, resolved_uri, resolved_name, err)
     end)
 end
 
