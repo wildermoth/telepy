@@ -2,6 +2,8 @@
 
 `telepy` is a Telescope extension for Python call/type hierarchy navigation that uses a fast custom parser, avoiding lsp reliance
 
+[Read the project write-up](https://wildermoth.com/posts/building-telepy).
+
 largely based off https://github.com/jmacadie/telescope-hierarchy.nvim 
 
 ## Usage
@@ -85,4 +87,3 @@ The `ft = { "python" }` trigger is required for `warm_parser_on_bufenter` to wor
     },
   },
 ```
-
